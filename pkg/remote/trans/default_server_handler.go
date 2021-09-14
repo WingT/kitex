@@ -18,6 +18,9 @@ package trans
 
 import (
 	"context"
+	"encoding/binary"
+	"github.com/cloudwego/kitex/pkg/gofunc"
+	"github.com/cloudwego/netpoll"
 	"net"
 	"runtime/debug"
 
@@ -47,6 +50,7 @@ type svrTransHandler struct {
 	codec      remote.Codec
 	transPipe  *remote.TransPipeline
 	ext        Extension
+	inlen      int
 }
 
 // Write implements the remote.ServerTransHandler interface.
@@ -92,29 +96,28 @@ func (t *svrTransHandler) Read(ctx context.Context, conn net.Conn, recvMsg remot
 
 // OnRead implements the remote.ServerTransHandler interface.
 func (t *svrTransHandler) OnRead(ctx context.Context, conn net.Conn) error {
+	// check full
+	reader := conn.(netpoll.Connection).Reader()
+	l := reader.Len()
+	if t.inlen <= 0 {
+		if l < 4 {
+			return nil
+		}
+		blen, _ := reader.Peek(4)
+		t.inlen = int(binary.BigEndian.Uint32(blen))
+	}
+	if l < t.inlen {
+		return nil
+	}
+	t.inlen = 0
+
 	ri := rpcinfo.GetRPCInfo(ctx)
-	t.ext.SetReadTimeout(ctx, conn, ri.Config(), remote.Server)
+	// t.ext.SetReadTimeout(ctx, conn, ri.Config(), remote.Server)
 	var err error
 	var closeConn bool
 	var recvMsg remote.Message
 	var sendMsg remote.Message
-	defer func() {
-		panicErr := recover()
-		if panicErr != nil {
-			closeConn = true
-			if conn != nil {
-				t.opt.Logger.Errorf("KITEX: panic happened, close conn[%s], %v\n%s", conn.RemoteAddr(), panicErr, string(debug.Stack()))
-			} else {
-				t.opt.Logger.Errorf("KITEX: panic happened, %v\n%s", panicErr, string(debug.Stack()))
-			}
-		}
-		if closeConn && conn != nil {
-			conn.Close()
-		}
-		t.finishTracer(ctx, ri, err, panicErr)
-		remote.RecycleMessage(recvMsg)
-		remote.RecycleMessage(sendMsg)
-	}()
+
 	ctx = t.startTracer(ctx, ri)
 	recvMsg = remote.NewMessageWithNewer(t.svcInfo, ri, remote.Call, remote.Server)
 	recvMsg.SetPayloadCodec(t.opt.PayloadCodec)
@@ -126,35 +129,55 @@ func (t *svrTransHandler) OnRead(ctx context.Context, conn net.Conn) error {
 		return nil
 	}
 
-	var methodInfo serviceinfo.MethodInfo
-	if methodInfo, err = GetMethodInfo(ri, t.svcInfo); err != nil {
-		// it won't be err, because the method has been checked in decode, err check here just do defensive inspection
-		closeConn = true
-		t.writeErrorReplyIfNeeded(ctx, recvMsg, conn, err, ri, true)
-		// for proxy case, need read actual remoteAddr, error print must exec after writeErrorReplyIfNeeded
-		t.OnError(ctx, err, conn)
-		return nil
-	}
-	if methodInfo.OneWay() {
-		sendMsg = remote.NewMessage(nil, t.svcInfo, ri, remote.Reply, remote.Server)
-	} else {
-		sendMsg = remote.NewMessage(methodInfo.NewResult(), t.svcInfo, ri, remote.Reply, remote.Server)
-	}
+	gofunc.GoFunc(ctx, func() {
+		defer func() {
+			panicErr := recover()
+			if panicErr != nil {
+				closeConn = true
+				if conn != nil {
+					t.opt.Logger.Errorf("KITEX: panic happened, close conn[%s], %v\n%s", conn.RemoteAddr(), panicErr, string(debug.Stack()))
+				} else {
+					t.opt.Logger.Errorf("KITEX: panic happened, %v\n%s", panicErr, string(debug.Stack()))
+				}
+			}
+			if closeConn && conn != nil {
+				conn.Close()
+			}
+			t.finishTracer(ctx, ri, err, panicErr)
+			remote.RecycleMessage(recvMsg)
+			remote.RecycleMessage(sendMsg)
+		}()
+		var methodInfo serviceinfo.MethodInfo
+		if methodInfo, err = GetMethodInfo(ri, t.svcInfo); err != nil {
+			// it won't be err, because the method has been checked in decode, err check here just do defensive inspection
+			closeConn = true
+			t.writeErrorReplyIfNeeded(ctx, recvMsg, conn, err, ri, true)
+			// for proxy case, need read actual remoteAddr, error print must exec after writeErrorReplyIfNeeded
+			t.OnError(ctx, err, conn)
+			return
+		}
+		if methodInfo.OneWay() {
+			sendMsg = remote.NewMessage(nil, t.svcInfo, ri, remote.Reply, remote.Server)
+		} else {
+			sendMsg = remote.NewMessage(methodInfo.NewResult(), t.svcInfo, ri, remote.Reply, remote.Server)
+		}
 
-	err = t.transPipe.OnMessage(ctx, recvMsg, sendMsg)
-	if err != nil {
-		// error cannot be wrapped to print here, so it must exec before NewTransError
-		t.OnError(ctx, err, conn)
-		err = remote.NewTransError(remote.InternalError, err)
-		t.writeErrorReplyIfNeeded(ctx, recvMsg, conn, err, ri, false)
-		return nil
-	}
+		err = t.transPipe.OnMessage(ctx, recvMsg, sendMsg)
+		if err != nil {
+			// error cannot be wrapped to print here, so it must exec before NewTransError
+			t.OnError(ctx, err, conn)
+			err = remote.NewTransError(remote.InternalError, err)
+			t.writeErrorReplyIfNeeded(ctx, recvMsg, conn, err, ri, false)
+			return
+		}
 
-	remote.FillSendMsgFromRecvMsg(recvMsg, sendMsg)
-	if err = t.transPipe.Write(ctx, conn, sendMsg); err != nil {
-		t.OnError(ctx, err, conn)
-		return nil
-	}
+		remote.FillSendMsgFromRecvMsg(recvMsg, sendMsg)
+		if err = t.transPipe.Write(ctx, conn, sendMsg); err != nil {
+			t.OnError(ctx, err, conn)
+			return
+		}
+		return
+	})
 	return nil
 }
 

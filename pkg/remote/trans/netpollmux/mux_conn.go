@@ -18,14 +18,15 @@ package netpollmux
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/cloudwego/kitex/pkg/gofunc"
 	"net"
 	"sync"
 
 	"github.com/cloudwego/netpoll"
 
-	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	np "github.com/cloudwego/kitex/pkg/remote/trans/netpoll"
@@ -52,29 +53,46 @@ type muxCliConn struct {
 
 // OnRequest is called when the connection creates.
 func (c *muxCliConn) OnRequest(ctx context.Context, connection netpoll.Connection) (err error) {
-	// check protocol header
-	length, seqID, err := parseHeader(connection.Reader())
-	if err != nil {
-		err = fmt.Errorf("%w: addr(%s)", err, connection.RemoteAddr())
-		return c.onError(err, connection)
+	// check full
+	reader := connection.Reader()
+	for {
+		l := reader.Len()
+		// check full
+		if l < 4 {
+			return nil
+		}
+		blen, _ := reader.Peek(4)
+		inlen := int(binary.BigEndian.Uint32(blen)) + 4
+		if l < inlen {
+			return nil
+		}
+		// read
+		// reader is nil if return error
+		r2, err := connection.Reader().Slice(inlen)
+		if err != nil {
+			err = fmt.Errorf("mux read package slice failed: addr(%s), %w", connection.RemoteAddr(), err)
+			return c.onError(err, connection)
+		}
+
+		// gofunc.GoFunc(ctx, func() {
+		gofunc.GoFunc(ctx, func() {
+			// check protocol header
+			length, seqID, err := parseHeader(r2)
+			if err != nil {
+				err = fmt.Errorf("%w: addr(%s)", err, connection.RemoteAddr())
+				c.onError(err, connection)
+			}
+
+			asyncCallback, ok := c.seqIDMap.load(seqID)
+			if !ok {
+				r2.Skip(length)
+				r2.Release()
+				return
+			}
+			bufReader := np.NewReaderByteBuffer(r2)
+			asyncCallback.Recv(bufReader, nil)
+		})
 	}
-	asyncCallback, ok := c.seqIDMap.load(seqID)
-	if !ok {
-		connection.Reader().Skip(length)
-		connection.Reader().Release()
-		return
-	}
-	// reader is nil if return error
-	reader, err := connection.Reader().Slice(length)
-	if err != nil {
-		err = fmt.Errorf("mux read package slice failed: addr(%s), %w", connection.RemoteAddr(), err)
-		return c.onError(err, connection)
-	}
-	gofunc.GoFunc(ctx, func() {
-		bufReader := np.NewReaderByteBuffer(reader)
-		asyncCallback.Recv(bufReader, nil)
-	})
-	return nil
 }
 
 // Close does nothing.
@@ -106,7 +124,8 @@ func newMuxSvrConn(connection netpoll.Connection, pool *sync.Pool) *muxSvrConn {
 
 type muxSvrConn struct {
 	muxConn
-	pool *sync.Pool // ctx with rpcInfo
+	pool  *sync.Pool // ctx with rpcInfo
+	inlen int
 }
 
 func newMuxConn(connection netpoll.Connection) muxConn {

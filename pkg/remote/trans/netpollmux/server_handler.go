@@ -18,6 +18,7 @@ package netpollmux
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -123,91 +124,101 @@ func (t *svrTransHandler) readWithByteBuffer(ctx context.Context, bufReader remo
 // Returns write err only.
 func (t *svrTransHandler) OnRead(muxSvrConnCtx context.Context, conn net.Conn) error {
 	defer t.tryRecover(muxSvrConnCtx, conn)
-
 	connection := conn.(netpoll.Connection)
-	// protocol header check
-	length, _, err := parseHeader(connection.Reader())
-	if err != nil {
-		err = fmt.Errorf("%w: addr(%s)", err, connection.RemoteAddr())
-		t.opt.Logger.Errorf("KITEX: %s", err.Error())
-		connection.Close()
-		return err
-	}
-	reader, err := connection.Reader().Slice(length)
-	if err != nil {
-		err = fmt.Errorf("%w: addr(%s)", err, connection.RemoteAddr())
-		t.opt.Logger.Errorf("KITEX: %s", err.Error())
-		connection.Close()
-		return nil
-	}
-
-	gofunc.GoFunc(muxSvrConnCtx, func() {
-		// rpcInfoCtx is a pooled ctx with inited RPCInfo which can be reused.
-		// it's recycled in defer.
-		muxSvrConn, _ := muxSvrConnCtx.Value(ctxKeyMuxSvrConn{}).(*muxSvrConn)
-		rpcInfoCtx := muxSvrConn.pool.Get().(context.Context)
-
-		rpcInfo := rpcinfo.GetRPCInfo(rpcInfoCtx)
-		// This is the request-level, one-shot ctx.
-		// It adds the tracer principally, thus do not recycle.
-		ctx := t.startTracer(rpcInfoCtx, rpcInfo)
-		var err error
-		var recvMsg remote.Message
-		var sendMsg remote.Message
-		defer func() {
-			panicErr := recover()
-			if panicErr != nil {
-				if conn != nil {
-					conn.Close()
-					t.opt.Logger.Errorf("KITEX: panic happened, close conn[%s], %v\n%s", conn.RemoteAddr(), panicErr, string(debug.Stack()))
-				} else {
-					t.opt.Logger.Errorf("KITEX: panic happened, %v\n%s", panicErr, string(debug.Stack()))
+	muxSvrConn, _ := muxSvrConnCtx.Value(ctxKeyMuxSvrConn{}).(*muxSvrConn)
+	for {
+		l := connection.Reader().Len()
+		// check full
+		if l < 4 {
+			return nil
+		}
+		blen, _ := connection.Reader().Peek(4)
+		length := int(binary.BigEndian.Uint32(blen)) + 4
+		if l < length {
+			return nil
+		}
+		// protocol header check
+		// length, _, err := parseHeader(connection.Reader())
+		// if err != nil {
+		// 	err = fmt.Errorf("%w: addr(%s)", err, connection.RemoteAddr())
+		// 	t.opt.Logger.Errorf("KITEX: %s", err.Error())
+		// 	connection.Close()
+		// 	return err
+		// }
+		reader, err := connection.Reader().Slice(length)
+		if err != nil {
+			err = fmt.Errorf("%w: addr(%s)", err, connection.RemoteAddr())
+			t.opt.Logger.Errorf("KITEX: %s", err.Error())
+			connection.Close()
+			return nil
+		}
+		
+		gofunc.GoFunc(muxSvrConnCtx, func() {
+			// rpcInfoCtx is a pooled ctx with inited RPCInfo which can be reused.
+			// it's recycled in defer.
+			rpcInfoCtx := muxSvrConn.pool.Get().(context.Context)
+			
+			rpcInfo := rpcinfo.GetRPCInfo(rpcInfoCtx)
+			// This is the request-level, one-shot ctx.
+			// It adds the tracer principally, thus do not recycle.
+			ctx := t.startTracer(rpcInfoCtx, rpcInfo)
+			var err error
+			var recvMsg remote.Message
+			var sendMsg remote.Message
+			defer func() {
+				panicErr := recover()
+				if panicErr != nil {
+					if conn != nil {
+						conn.Close()
+						t.opt.Logger.Errorf("KITEX: panic happened, close conn[%s], %v\n%s", conn.RemoteAddr(), panicErr, string(debug.Stack()))
+					} else {
+						t.opt.Logger.Errorf("KITEX: panic happened, %v\n%s", panicErr, string(debug.Stack()))
+					}
 				}
+				t.finishTracer(ctx, rpcInfo, err, panicErr)
+				remote.RecycleMessage(recvMsg)
+				remote.RecycleMessage(sendMsg)
+				muxSvrConn.pool.Put(rpcInfoCtx)
+			}()
+			
+			// read
+			recvMsg = remote.NewMessageWithNewer(t.svcInfo, rpcInfo, remote.Call, remote.Server)
+			bufReader := np.NewReaderByteBuffer(reader)
+			err = t.readWithByteBuffer(ctx, bufReader, recvMsg)
+			if err != nil {
+				t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false, true)
+				// for proxy case, need read actual remoteAddr, error print must exec after writeErrorReplyIfNeeded
+				t.OnError(ctx, err, muxSvrConn)
+				return
 			}
-			t.finishTracer(ctx, rpcInfo, err, panicErr)
-			remote.RecycleMessage(recvMsg)
-			remote.RecycleMessage(sendMsg)
-			muxSvrConn.pool.Put(rpcInfoCtx)
-		}()
-
-		// read
-		recvMsg = remote.NewMessageWithNewer(t.svcInfo, rpcInfo, remote.Call, remote.Server)
-		bufReader := np.NewReaderByteBuffer(reader)
-		err = t.readWithByteBuffer(ctx, bufReader, recvMsg)
-		if err != nil {
-			t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false, true)
-			// for proxy case, need read actual remoteAddr, error print must exec after writeErrorReplyIfNeeded
-			t.OnError(ctx, err, muxSvrConn)
-			return
-		}
-
-		var methodInfo serviceinfo.MethodInfo
-		if methodInfo, err = trans.GetMethodInfo(rpcInfo, t.svcInfo); err != nil {
-			t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false, true)
-			t.OnError(ctx, err, muxSvrConn)
-			return
-		}
-		if methodInfo.OneWay() {
-			sendMsg = remote.NewMessage(nil, t.svcInfo, rpcInfo, remote.Reply, remote.Server)
-		} else {
-			sendMsg = remote.NewMessage(methodInfo.NewResult(), t.svcInfo, rpcInfo, remote.Reply, remote.Server)
-		}
-		err = t.transPipe.OnMessage(ctx, recvMsg, sendMsg)
-		if err != nil {
-			// error cannot be wrapped to print here, so it must exec before NewTransError
-			t.OnError(ctx, err, muxSvrConn)
-			err = remote.NewTransError(remote.InternalError, err)
-			t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false, false)
-			return
-		}
-
-		remote.FillSendMsgFromRecvMsg(recvMsg, sendMsg)
-		if err = t.transPipe.Write(ctx, muxSvrConn, sendMsg); err != nil {
-			t.OnError(ctx, err, muxSvrConn)
-			return
-		}
-	})
-	return nil
+			
+			var methodInfo serviceinfo.MethodInfo
+			if methodInfo, err = trans.GetMethodInfo(rpcInfo, t.svcInfo); err != nil {
+				t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false, true)
+				t.OnError(ctx, err, muxSvrConn)
+				return
+			}
+			if methodInfo.OneWay() {
+				sendMsg = remote.NewMessage(nil, t.svcInfo, rpcInfo, remote.Reply, remote.Server)
+			} else {
+				sendMsg = remote.NewMessage(methodInfo.NewResult(), t.svcInfo, rpcInfo, remote.Reply, remote.Server)
+			}
+			err = t.transPipe.OnMessage(ctx, recvMsg, sendMsg)
+			if err != nil {
+				// error cannot be wrapped to print here, so it must exec before NewTransError
+				t.OnError(ctx, err, muxSvrConn)
+				err = remote.NewTransError(remote.InternalError, err)
+				t.writeErrorReplyIfNeeded(ctx, recvMsg, muxSvrConn, rpcInfo, err, false, false)
+				return
+			}
+			
+			remote.FillSendMsgFromRecvMsg(recvMsg, sendMsg)
+			if err = t.transPipe.Write(ctx, muxSvrConn, sendMsg); err != nil {
+				t.OnError(ctx, err, muxSvrConn)
+				return
+			}
+		})
+	}
 }
 
 // OnMessage implements the remote.ServerTransHandler interface.
