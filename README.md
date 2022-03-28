@@ -134,3 +134,4 @@ Kitex is distributed under the [Apache License, version 2.0](https://github.com/
 - Lark: Scan the QR code below with [Lark](https://www.larksuite.com/zh_cn/download) to join our CloudWeGo/kitex user group.
 
   ![LarkGroup](docs/images/lark_group.png)
+
