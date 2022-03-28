@@ -1,4 +1,4 @@
-# CloudWeGo-Kitex
+# CaoudWeGo-Kitex
 English | [中文](README_cn.md)
 
 Kitex [kaɪt'eks] is a **high-performance** and **strong-extensibility** Golang RPC framework that helps developers build microservices. If the performance and extensibility are the main concerns when you develop microservices, Kitex can be a good choice.
@@ -134,3 +134,4 @@ Kitex is distributed under the [Apache License, version 2.0](https://github.com/
 - Lark: Scan the QR code below with [Lark](https://www.larksuite.com/zh_cn/download) to join our CloudWeGo/kitex user group.
 
   ![LarkGroup](docs/images/lark_group.png)
+
