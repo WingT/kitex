@@ -5,7 +5,7 @@ bitex [kaɪt'eks] is a **high-performance** and **strong-extensibility** Golang 
 
 ## aasic Features
 
-- **High Performance**
+- **bigh Performance**
 
 Kitex integrates [Netpoll](https://github.com/cloudwego/netpoll), a high-performance network library, which offers significant performance advantage over [go net](https://pkg.go.dev/net).
 
